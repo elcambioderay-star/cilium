@@ -436,17 +436,3 @@ func (l *loader) Reinitialize(ctx context.Context, lnc *config.Config, tunnelCon
 
 	return nil
 }
-
-func (l *loader) EnsureIPIPDevices(ipv4, ipv6 bool, mtu int) error {
-	// This setting needs to be applied before creating the IPIP devices.
-	sysIPIP := []tables.Sysctl{
-		{Name: []string{"net", "core", "fb_tunnels_only_for_init_net"}, Val: "2", IgnoreErr: true},
-	}
-	if err := l.sysctl.ApplySettings(sysIPIP); err != nil {
-		return err
-	}
-	if err := setupIPIPDevices(l.logger, l.sysctl, ipv4, ipv6, mtu); err != nil {
-		return fmt.Errorf("unable to create ipip devices: %w", err)
-	}
-	return nil
-}

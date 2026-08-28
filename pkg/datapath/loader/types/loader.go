@@ -27,7 +27,6 @@ type Loader interface {
 	ReinitializeHostDev(ctx context.Context, mtu int) error
 	Reinitialize(ctx context.Context, cfg *config.Config, tunnelConfig tunnel.Config, iptMgr iptables.Manager, p proxy.Proxy, bigtcp bigtcp.Config) error
 	WriteEndpointConfig(w io.Writer, cfg endpoint.Config) error
-	EnsureIPIPDevices(ipv4, ipv6 bool, mtu int) error
 }
 
 // CompilationLock is a interface over a mutex, it is used by both the loader, daemon

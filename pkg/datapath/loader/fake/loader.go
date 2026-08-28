@@ -58,7 +58,3 @@ func (f *Loader) DetachXDP(ifaceName string, bpffsBase, progName string) error {
 func (f *Loader) WriteEndpointConfig(w io.Writer, e endpoint.Config) error {
 	return nil
 }
-
-func (f *Loader) EnsureIPIPDevices(ipv4, ipv6 bool, mtu int) error {
-	return nil
-}

@@ -20,6 +20,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/connector"
 	"github.com/cilium/cilium/pkg/datapath/iptables"
 	"github.com/cilium/cilium/pkg/datapath/linux/bigtcp"
+	"github.com/cilium/cilium/pkg/datapath/linux/device"
 	ipsec "github.com/cilium/cilium/pkg/datapath/linux/ipsec/types"
 	"github.com/cilium/cilium/pkg/datapath/linux/sysctl"
 	"github.com/cilium/cilium/pkg/datapath/loader/metrics"
@@ -343,12 +344,17 @@ func (o *orchestrator) ensureIPIPDevices(agentConfig *option.DaemonConfig) (<-ch
 		return mtuWatch, fmt.Errorf("default route MTU is not available")
 	}
 
-	err := o.params.Loader.EnsureIPIPDevices(
+	err := device.SetupIPIPDevices(
+		o.params.Log,
+		o.params.Sysctl,
 		agentConfig.IPv4Enabled(),
 		agentConfig.IPv6Enabled(),
 		mtuRoute.DeviceMTU,
 	)
-	return mtuWatch, err
+	if err != nil {
+		return mtuWatch, fmt.Errorf("reconciling IPIP devices: %w", err)
+	}
+	return mtuWatch, nil
 }
 
 func (o *orchestrator) DatapathInitialized() <-chan struct{} {
