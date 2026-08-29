@@ -15,6 +15,7 @@ import (
 
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/identity/numericidentity"
 	api "github.com/cilium/cilium/pkg/k8s/apis/cilium.io"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/lock"
@@ -39,11 +40,11 @@ const (
 
 	// IdentityScopeLocal is the tag in the numeric identity that identifies
 	// a numeric identity to have local (CIDR) scope.
-	IdentityScopeLocal = NumericIdentity(1 << 24)
+	IdentityScopeLocal = NumericIdentity(1 << numericidentity.Bitlength)
 
 	// IdentityScopeRemoteNode is the tag in the numeric identity that identifies
 	// an identity to be a remote in-cluster node.
-	IdentityScopeRemoteNode = NumericIdentity(2 << 24)
+	IdentityScopeRemoteNode = NumericIdentity(2 << numericidentity.Bitlength)
 
 	// MinAllocatorLocalIdentity represents the minimal numeric identity
 	// that the localIdentityCache allocator can allocate for a local (CIDR)
@@ -73,7 +74,7 @@ const (
 
 	// MinimalNumericIdentity represents the minimal numeric identity not
 	// used for reserved purposes.
-	MinimalNumericIdentity = NumericIdentity(256)
+	MinimalNumericIdentity = NumericIdentity(numericidentity.MinimalIdentity)
 
 	// UserReservedNumericIdentity represents the minimal numeric identity that
 	// can be used by users for reserved purposes.
@@ -85,13 +86,9 @@ const (
 )
 
 var (
-	// clusterIDInit ensures that clusterIDBits and clusterIDShift can only be
-	// set once, and only if we haven't used either value elsewhere already.
+	// clusterIDInit ensures that clusterIDShift can only be set once, and only if
+	// we haven't used the value elsewhere already.
 	clusterIDInit sync.Once
-
-	// clusterIDBits is the number of bits that represent a cluster ID in a
-	// numeric identity
-	clusterIDBits uint32
 
 	// clusterIDShift is the number of bits to shift a cluster ID in a numeric
 	// identity and is equal to the number of bits that represent a cluster-local identity.
@@ -349,37 +346,30 @@ func GetClusterIDShift() uint32 {
 	return clusterIDShift
 }
 
-// GetClusterIDBits returns the number of bits that represent a cluster ID in a numeric identity
-// A sync.Once is used to ensure we only initialize clusterIDBits once.
-func GetClusterIDBits() uint32 {
-	clusterIDInit.Do(initClusterIDShift)
-	return clusterIDBits
-}
-
 // initClusterIDShift sets variables that control the bit allocation of cluster
 // ID in a numeric identity.
 func initClusterIDShift() {
 	// ClusterIDLen is the number of bits that represent a cluster ID in a numeric identity
-	clusterIDBits = uint32(math.Log2(float64(cmtypes.ClusterIDMax + 1)))
+	clusterIDBits := uint32(math.Log2(float64(cmtypes.ClusterIDMax + 1)))
 	// ClusterIDShift is the number of bits to shift a cluster ID in a numeric identity
 	clusterIDShift = NumericIdentityBitlength - clusterIDBits
 }
 
-// GetMinimalNumericIdentity returns the minimal numeric identity not used for
-// reserved purposes.
-func GetMinimalAllocationIdentity(clusterID uint32) NumericIdentity {
+// MinimalAllocationIdentity returns the first allocatable identity in the
+// range assigned to the given cluster ID and layout.
+func MinimalAllocationIdentity(clusterID, clusterIDShift uint32) uint32 {
 	if clusterID > 0 {
 		// For ClusterID > 0, the identity range just starts from cluster shift,
 		// no well-known-identities need to be reserved from the range.
-		return NumericIdentity((1 << GetClusterIDShift()) * clusterID)
+		return (1 << clusterIDShift) * clusterID
 	}
-	return MinimalNumericIdentity
+	return numericidentity.MinimalIdentity
 }
 
-// GetMaximumAllocationIdentity returns the maximum numeric identity that
-// should be handed out by the identity allocator.
-func GetMaximumAllocationIdentity(clusterID uint32) NumericIdentity {
-	return NumericIdentity((1<<GetClusterIDShift())*(clusterID+1) - 1)
+// MaximumAllocationIdentity returns the last allocatable identity in the range
+// assigned to the given cluster ID and layout.
+func MaximumAllocationIdentity(clusterID, clusterIDShift uint32) uint32 {
+	return (1<<clusterIDShift)*(clusterID+1) - 1
 }
 
 var (
