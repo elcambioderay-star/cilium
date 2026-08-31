@@ -159,13 +159,33 @@ jobs:
 
             echo "Cluster ${cluster} age: ${CLUSTER_AGE_HOURS} hours"
 
-            # Delete clusters older than 3 hours
+            # Delete clusters older than MAX_AGE_HOURS
             if [ ${CREATION_TIMESTAMP} -lt ${HOURS_AGO} ]; then
-              # Check if kubeconfig exists in S3 pool before deleting
-              # If it doesn't exist, the cluster is being used and should not be deleted
-              S3_BUCKET="${{ format('{0}-{1}-eks-kubeconfig-pool', github.repository_owner, github.event.repository.name) }}"
-              if [ -n "${S3_BUCKET}" ]; then
-                echo "Checking if kubeconfig for cluster ${cluster} exists in S3 bucket ${S3_BUCKET}"
+              # A cluster claimed by a test run is stamped by setup-eks-cluster
+              # with the lease it is claimed for. While that lease is in the
+              # future the cluster is in use whatever its age: a cluster claimed
+              # at 5h59m old is otherwise reaped by the very next cron, mid-test,
+              # and the run only sees its workers vanish.
+              LEASE_EXPIRES_AT=$(echo "${cluster_info}" | jq -r '.tags["lease-expires-at"] // empty')
+              # A malformed lease is treated as no lease at all, so that the
+              # conservative path below decides rather than this one.
+              if ! [[ "${LEASE_EXPIRES_AT}" =~ ^[0-9]+$ ]]; then
+                LEASE_EXPIRES_AT=""
+              fi
+              if [ -n "${LEASE_EXPIRES_AT}" ] && [ "${LEASE_EXPIRES_AT}" -gt "${CURRENT_TIME}" ]; then
+                CLAIMED_BY=$(echo "${cluster_info}" | jq -r '.tags["claimed-by"] // "unknown"')
+                echo "Cluster ${cluster} is leased by ${CLAIMED_BY} for another $(( (LEASE_EXPIRES_AT - CURRENT_TIME) / 60 )) minutes, skipping deletion"
+                continue
+              fi
+
+              if [ -n "${LEASE_EXPIRES_AT}" ]; then
+                echo "Lease of cluster ${cluster} expired at $(date -u -d "@${LEASE_EXPIRES_AT}" +%Y-%m-%dT%H:%M:%SZ), proceeding with deletion"
+              else
+                # A cluster claimed before leases existed carries no tag, so fall
+                # back to the pool bookkeeping: a kubeconfig missing from the pool
+                # means someone took the cluster. That check is racy, which is why
+                # the lease above exists, but it is the conservative answer here.
+                echo "Cluster ${cluster} carries no lease, checking whether its kubeconfig is still in the S3 pool"
                 KUBECONFIG_EXISTS=$(aws s3 ls "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --region ${REGION} | grep -c "${cluster}-" || true)
 
                 if [ "${KUBECONFIG_EXISTS}" -eq "0" ]; then
@@ -174,11 +194,11 @@ jobs:
                 fi
 
                 echo "Kubeconfig found in pool for cluster ${cluster} (age: ${CLUSTER_AGE_HOURS} hours), proceeding with deletion"
-
-                # Remove kubeconfig from S3 pool
-                echo "Removing kubeconfigs for cluster ${cluster} from S3 bucket ${S3_BUCKET}"
-                aws s3 rm "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --exclude "*" --include "${cluster}-*" --region ${REGION} || true
               fi
+
+              # Remove any kubeconfig of this cluster from the S3 pool
+              echo "Removing kubeconfigs for cluster ${cluster} from S3 bucket ${S3_BUCKET}"
+              aws s3 rm "s3://${S3_BUCKET}/kubeconfig-pool/" --recursive --exclude "*" --include "${cluster}-*" --region ${REGION} || true
 
               # Trigger the eks-cluster-delete workflow to delete the cluster
               echo "Triggering eks-cluster-delete workflow for cluster ${cluster} in region ${REGION}"

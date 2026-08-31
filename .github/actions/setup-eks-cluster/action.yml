@@ -25,6 +25,10 @@ inputs:
     description: 'Space-separated list of add-ons to include'
     required: false
     default: 'coredns kube-proxy vpc-cni'
+  lease-minutes:
+    description: 'How long a cluster claimed from the pool is stamped as in use. Must cover the claiming job timeout; the pool manager will not reap a cluster before its lease expires.'
+    required: false
+    default: '180'
 outputs:
   cluster_name:
     description: 'Actual cluster name (from pool or newly created)'
@@ -78,6 +82,9 @@ runs:
 
             echo "Trying kubeconfig: ${KUBECONFIG_KEY}"
 
+            # Extract cluster name from filename (format: cluster-name-timestamp.yaml)
+            CLUSTER_NAME=$(echo "${KUBECONFIG_KEY}" | sed 's/-[0-9]\+\.yaml$//')
+
             # Generate a unique claim ID for this job run
             CLAIM_ID="${{ github.run_id }}-${{ github.run_attempt }}-${RANDOM}"
             CLAIM_KEY="${S3_PREFIX}claimed/${KUBECONFIG_KEY}.${CLAIM_ID}"
@@ -86,14 +93,30 @@ runs:
             # Atomically claim by moving the file to a unique location
             # The first job to successfully move will win; others will fail on source not found
             if aws s3 mv "s3://${S3_BUCKET}/${S3_PREFIX}${KUBECONFIG_KEY}" "s3://${S3_BUCKET}/${CLAIM_KEY}" --region ${{ inputs.region }} 2>/dev/null; then
-              # We won the race - now download from our claimed location
+              # We won the race. So far the claim exists only as the absence of
+              # an object in our own S3 bucket, which nothing on the AWS side can
+              # see: the cluster keeps the pool tags and an ever-ageing createdAt,
+              # so any age or tag based reaper is free to tear it down under the
+              # run. Stamp the lease onto the cluster itself, in band, before
+              # doing anything else with it.
+              NOW=$(date +%s)
+              LEASE_EXPIRES_AT=$((NOW + ${{ inputs.lease-minutes }} * 60))
+              CLUSTER_ARN=$(aws eks describe-cluster --name "${CLUSTER_NAME}" \
+                --region ${{ inputs.region }} --query 'cluster.arn' --output text 2>/dev/null || true)
+              if [ -n "${CLUSTER_ARN}" ] && [ "${CLUSTER_ARN}" != "None" ]; then
+                aws eks tag-resource --resource-arn "${CLUSTER_ARN}" --region ${{ inputs.region }} \
+                  --tags "claimed-by=${{ github.run_id }}/${{ github.run_attempt }},claimed-at=${NOW},lease-expires-at=${LEASE_EXPIRES_AT}" \
+                  && echo "Leased ${CLUSTER_NAME} until $(date -u -d "@${LEASE_EXPIRES_AT}" +%Y-%m-%dT%H:%M:%SZ)" \
+                  || echo "::warning::Failed to tag cluster ${CLUSTER_NAME} with its lease, a reaper cannot tell it is in use"
+              else
+                echo "::warning::Could not resolve the ARN of cluster ${CLUSTER_NAME}, lease not recorded"
+              fi
+
+              # Download from our claimed location
               if aws s3 cp "s3://${S3_BUCKET}/${CLAIM_KEY}" "${KUBECONFIG_PATH}" --region ${{ inputs.region }}; then
                 # Clean up the claimed file
                 aws s3 rm "s3://${S3_BUCKET}/${CLAIM_KEY}" --region ${{ inputs.region }} || true
                 echo "Successfully claimed kubeconfig: ${KUBECONFIG_KEY}"
-
-                # Extract cluster name from filename (format: cluster-name-timestamp.yaml)
-                CLUSTER_NAME=$(echo "${KUBECONFIG_KEY}" | sed 's/-[0-9]\+\.yaml$//')
 
                 # Health check: verify cluster is accessible
                 echo "Checking cluster health for ${CLUSTER_NAME}..."

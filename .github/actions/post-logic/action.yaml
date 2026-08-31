@@ -16,6 +16,15 @@ inputs:
   always_capture_sysdump:
     description: "Always capture sysdump, regardless of test status; the result is uploaded as artifact only in case of test failure"
     default: "false"
+  capture_eks_cluster_forensics:
+    description: "On an EKS failure, capture forensics about the cluster's AWS resources (EKS and nodegroup status, subnets, ASG activities, CloudFormation stack events and the CloudTrail principal behind a delete), to tell a teardown of the cluster apart from a Cilium regression. Requires eks_cluster_name."
+    default: "false"
+  eks_cluster_name:
+    description: "Name of the EKS cluster to interrogate when capture_eks_cluster_forensics is enabled."
+    default: ""
+  eks_node_baseline:
+    description: "Path to a kubectl get nodes -o json taken while the EKS cluster was healthy, so that nodes already reaped are still interrogated."
+    default: ""
   junits-directory:
     description: "Directory where JUnit XML files are stored."
     default: cilium-junits
@@ -38,6 +47,18 @@ runs:
         kubectl get pods --all-namespaces -o wide
         cilium status
         cilium sysdump --output-filename "cilium-sysdump-${{ inputs.artifacts_suffix }}"
+
+    # Interrogate AWS before the caller triggers the cluster deletion, while the
+    # cluster's nodegroups, subnets and CloudFormation stacks are still there to
+    # be described.
+    - name: EKS cluster forensics
+      if: ${{ always() && inputs.job_status == 'failure' && inputs.capture_eks_cluster_forensics == 'true' && inputs.eks_cluster_name != '' }}
+      uses: ./.github/actions/eks-cluster-forensics
+      with:
+        artifacts_suffix: "${{ inputs.artifacts_suffix }}"
+        cluster_name: "${{ inputs.eks_cluster_name }}"
+        node_baseline: "${{ inputs.eks_node_baseline }}"
+        phase: post
 
     - name: Upload artifacts
       if: ${{ always() && inputs.job_status != 'success' }}
