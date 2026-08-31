@@ -97,3 +97,8 @@ func (dr DirectRoutingDevice) Get(ctx context.Context, rxn statedb.ReadTxn) (*De
 	}
 	return device, watch
 }
+
+// For testing purposes only.
+func (dr DirectRoutingDevice) Set(dev string) {
+	dr.p.Config.DirectRoutingDevice = "test0"
+}
