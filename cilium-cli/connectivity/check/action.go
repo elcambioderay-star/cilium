@@ -404,6 +404,7 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 				a.test.Debugf("command %q failed as expected: %s", cmdStr, err)
 			} else {
 				a.Failf("command %q failed with unexpected exit code: %s (expected %d, found %d)", cmdStr, err, expectedExitCode, exitCode)
+				showOutput = true
 			}
 		}
 	} else if curlCode, lost := lostCurlExitCode(output, errOutput); lost {
@@ -430,7 +431,28 @@ func (a *Action) ExecInPod(ctx context.Context, cmd []string) {
 		a.test.Log(strings.TrimSpace(output.String()))
 		a.test.Infof("%s stderr:", cmdName)
 		a.test.Log(strings.TrimSpace(errOutput.String()))
+		a.logSourceTCPCounters(ctx, cmdName)
 		a.test.Log()
+	}
+}
+
+// logSourceTCPCounters reports the source pod's TCP counters after an
+// unexpected curl result, next to the baseline taken once the deployments were
+// ready.
+func (a *Action) logSourceTCPCounters(ctx context.Context, cmdName string) {
+	if cmdName != "curl" || a.src == nil {
+		return
+	}
+
+	counters, err := a.test.ctx.collectTCPCounters(ctx, *a.src)
+	if err != nil {
+		a.test.Infof("unable to read TCP counters of pod %s: %s", a.src.Name(), err)
+		return
+	}
+
+	a.test.Infof("%s TCP counters: %s", a.src.Name(), counters)
+	if base, ok := a.test.ctx.tcpCountersBaseline[a.src.Name()]; ok {
+		a.test.Infof("%s TCP counters since deployments were ready: %s", a.src.Name(), counters.Sub(base))
 	}
 }
 

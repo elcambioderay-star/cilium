@@ -3298,5 +3298,7 @@ func (ct *ConnectivityTest) validateDeployment(ctx context.Context) error {
 		ct.l7LBNonL7Service[svc.Name] = s
 	}
 
+	ct.collectTCPCountersBaseline(ctx)
+
 	return nil
 }

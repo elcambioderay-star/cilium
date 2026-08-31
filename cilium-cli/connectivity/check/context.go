@@ -96,6 +96,10 @@ type ConnectivityTest struct {
 	secondaryNetworkNodeIPv4 map[string]string // node name => secondary ip
 	secondaryNetworkNodeIPv6 map[string]string // node name => secondary ip
 
+	// tcpCountersBaseline holds the client pods' TCP counters as of the moment
+	// the deployments became ready, keyed by namespaced pod name.
+	tcpCountersBaseline map[string]tcpCounters
+
 	tests     []*Test
 	testNames map[string]struct{}
 
@@ -251,6 +255,7 @@ func NewConnectivityTest(
 		hostNetNSPodsByNode:      make(map[string]Pod),
 		secondaryNetworkNodeIPv4: make(map[string]string),
 		secondaryNetworkNodeIPv6: make(map[string]string),
+		tcpCountersBaseline:      make(map[string]tcpCounters),
 		nodes:                    make(map[string]*slimcorev1.Node),
 		nodesWithoutCilium:       make(map[string]struct{}),
 		ciliumNodes:              make(map[NodeIdentity]*ciliumv2.CiliumNode),
@@ -1114,9 +1119,15 @@ func (ct *ConnectivityTest) CurlCommandWithOutput(peer TestPeer, ipFam features.
 	return cmd
 }
 
+// curlWriteOut is written for every curl, passing or failing, so that a failed
+// action ships the phase timings of its own healthy siblings next to it.
+const curlWriteOut = "%{local_ip}:%{local_port} -> %{remote_ip}:%{remote_port} = %{response_code}" +
+	" t_dns=%{time_namelookup} t_conn=%{time_connect} t_tls=%{time_appconnect}" +
+	" t_tot=%{time_total} exit=%{exitcode} err=%{errormsg}\n"
+
 func (ct *ConnectivityTest) CurlCommand(peer TestPeer, ipFam features.IPFamily, expectingSuccess bool, opts []string) []string {
 	return ct.CurlCommandWithOutput(peer, ipFam, expectingSuccess, append([]string{
-		"-w", "%{local_ip}:%{local_port} -> %{remote_ip}:%{remote_port} = %{response_code}\n",
+		"-w", curlWriteOut,
 		"--output", "/dev/null",
 	}, opts...))
 }
