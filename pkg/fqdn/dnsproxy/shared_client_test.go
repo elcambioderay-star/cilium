@@ -4,9 +4,11 @@
 package dnsproxy
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strconv"
@@ -18,12 +20,13 @@ import (
 	"time"
 
 	"github.com/cilium/dns"
+	"github.com/cilium/hive/hivetest"
 	"golang.org/x/net/nettest"
 	"golang.org/x/sync/errgroup"
 )
 
 var (
-	clients = NewSharedClients()
+	clients = NewSharedClients(slog.New(slog.DiscardHandler))
 )
 
 func TestSharedClientSync(t *testing.T) {
@@ -216,7 +219,7 @@ func TestSharedClientMixedSize(t *testing.T) {
 	}
 	c.conn = conn
 	c.wg.Add(1)
-	go handler(&c.wg, c.Client, c.conn, c.requests, &c.udpSize)
+	go handler(hivetest.Logger(t), &c.wg, c.Client, c.conn, c.requests, &c.udpSize, &c.reads)
 
 	// Asynchronous so that the second message can be sent, on which the server synchronises.
 	errSmallQuery := make(chan error)
@@ -330,11 +333,43 @@ func TestSharedClientSyncBadID(t *testing.T) {
 		Timeout: 10 * time.Millisecond,
 	}
 
-	_, _, closer, err := clients.Exchange("", conf, m, addrstr)
+	var logged bytes.Buffer
+	badIDClients := NewSharedClients(slog.New(slog.NewTextHandler(&logged, nil)))
+
+	_, _, closer, err := badIDClients.Exchange("", conf, m, addrstr)
 	defer closer()
 
 	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Errorf("query did not time out")
+	}
+	// The response did reach the upstream socket, it just matched no request.
+	if !strings.Contains(err.Error(), "upstream datagrams read since send: 1") {
+		t.Errorf("timeout does not report the datagram read from upstream: %v", err)
+	}
+	if !strings.Contains(logged.String(), "Discarding upstream DNS response that matches no pending request") {
+		t.Errorf("unmatched response was not logged: %s", logged.String())
+	}
+}
+
+func TestSharedClientSyncNoResponse(t *testing.T) {
+	// A server that never responds, so that nothing reaches the upstream socket.
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{})
+	if err != nil {
+		t.Fatalf("unable to run test server: %v", err)
+	}
+	defer conn.Close()
+
+	m := new(dns.Msg)
+	m.SetQuestion("miek.nl.", dns.TypeSOA)
+
+	_, _, closer, err := clients.Exchange("", &dns.Client{Timeout: 100 * time.Millisecond}, m, conn.LocalAddr().String())
+	defer closer()
+
+	if err == nil || !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("query did not time out")
+	}
+	if !strings.Contains(err.Error(), "upstream datagrams read since send: 0") {
+		t.Errorf("timeout does not report the empty upstream socket: %v", err)
 	}
 }
 

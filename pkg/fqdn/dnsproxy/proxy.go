@@ -31,6 +31,7 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
@@ -107,6 +108,11 @@ type DNSProxy struct {
 	// maxIPsPerRestoredDNSRule is the maximum number of IPs to maintain for each
 	// restored DNS rule.
 	maxIPsPerRestoredDNSRule int
+
+	// ctMaps gives the datapath's view of a forwarded lookup that timed out. It
+	// is nil where the conntrack maps are not available, e.g. in the standalone
+	// DNS proxy.
+	ctMaps ctmap.CTMaps
 
 	// this mutex protects variables below this point
 	lock.RWMutex
@@ -575,7 +581,7 @@ type DNSProxyConfig struct {
 // addresses.
 // port is the port to bind to for both UDP and TCP. 0 causes the kernel to
 // select a free port.
-func NewDNSProxy(dnsProxyConfig DNSProxyConfig, proxyLookupHandler lookup.ProxyLookupHandler, notifyFunc NotifyOnDNSMsgFunc) *DNSProxy {
+func NewDNSProxy(dnsProxyConfig DNSProxyConfig, proxyLookupHandler lookup.ProxyLookupHandler, notifyFunc NotifyOnDNSMsgFunc, ctMaps ctmap.CTMaps) *DNSProxy {
 
 	p := &DNSProxy{
 		logger:                   dnsProxyConfig.Logger,
@@ -592,7 +598,8 @@ func NewDNSProxy(dnsProxyConfig DNSProxyConfig, proxyLookupHandler lookup.ProxyL
 		cache:                    make(regexCache),
 		EnableDNSCompression:     dnsProxyConfig.EnableDNSCompression,
 		maxIPsPerRestoredDNSRule: dnsProxyConfig.MaxRestoreDNSIPs,
-		DNSClients:               NewSharedClients(),
+		ctMaps:                   ctMaps,
+		DNSClients:               NewSharedClients(dnsProxyConfig.Logger),
 		rejectReply:              dns.RcodeRefused,
 	}
 	if dnsProxyConfig.ConcurrencyLimit > 0 {
@@ -1090,7 +1097,12 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	if err != nil {
 		stat.Err = err
 		if stat.IsTimeout() {
-			scopedLog.Warn("Timeout waiting for response to forwarded proxied DNS lookup", logfields.Error, err)
+			scopedLog.Warn(
+				"Timeout waiting for response to forwarded proxied DNS lookup",
+				logfields.Error, err,
+				logfields.Server, targetServer,
+				logfields.ConntrackEntry, p.conntrackEntry(proto, addrPort, targetServer),
+			)
 			p.NotifyOnDNSMsg(time.Now(), ep, epIPPort, targetServerID, targetServer, requestDetails, protocol, false, &stat)
 			return
 		}
@@ -1143,6 +1155,26 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		// of DNS server IPs that are allowed by a policy and for which successful response was received.
 		p.usedServers[targetServer.Addr()] = struct{}{}
 		p.Unlock()
+	}
+}
+
+// conntrackEntry renders the datapath's conntrack entry for the endpoint's DNS
+// flow. The reply of a flow whose entry lost the ProxyRedirect flag is
+// delivered to the endpoint instead of to the proxy, which leaves no other
+// trace in the host network namespace.
+func (p *DNSProxy) conntrackEntry(proto u8proto.U8proto, client, server netip.AddrPort) string {
+	if p.ctMaps == nil {
+		return "unavailable"
+	}
+
+	entry, err := ctmap.LookupEgress(p.ctMaps, proto, client, server)
+	switch {
+	case err != nil:
+		return "lookup failed: " + err.Error()
+	case entry == nil:
+		return "none"
+	default:
+		return strings.TrimSpace(entry.String())
 	}
 }
 

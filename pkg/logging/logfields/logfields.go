@@ -1953,4 +1953,10 @@ const (
 	PendingInitializers = "pendingInitializers"
 
 	VFCount = "vFCount"
+
+	// PendingDNSRequestIDs are the ids of the DNS requests awaiting a response
+	PendingDNSRequestIDs = "pendingDNSRequestIDs"
+
+	// ConntrackEntry is a datapath conntrack entry, rendered as by 'cilium bpf ct list'
+	ConntrackEntry = "conntrackEntry"
 )

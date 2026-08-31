@@ -8,26 +8,33 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 
 	"github.com/cilium/dns"
 
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/time"
 )
 
 // SharedClients holds a set of SharedClient instances.
 type SharedClients struct {
+	logger *slog.Logger
+
 	// SharedClient's lock must not be taken while this lock is held!
 	lock lock.Mutex
 	// clients are created and destroyed on demand, hence 'Mutex' needs to be taken.
 	clients map[string]*SharedClient
 }
 
-func NewSharedClients() *SharedClients {
+func NewSharedClients(logger *slog.Logger) *SharedClients {
 	return &SharedClients{
+		logger:  logger,
 		clients: make(map[string]*SharedClient),
 	}
 }
@@ -76,7 +83,7 @@ func (s *SharedClients) ShutdownTCPClient(key string) {
 func (s *SharedClients) GetSharedClient(key string, conf *dns.Client, serverAddrStr string) (client *SharedClient, closer func()) {
 	if key == "" {
 		// Simplified case when the client is actually not shared
-		client = newSharedClient(conf, serverAddrStr)
+		client = newSharedClient(s.logger, conf, serverAddrStr)
 		return client, client.close
 	}
 	for {
@@ -85,7 +92,7 @@ func (s *SharedClients) GetSharedClient(key string, conf *dns.Client, serverAddr
 		// locate client to re-use if possible.
 		client = s.clients[key]
 		if client == nil {
-			client = newSharedClient(conf, serverAddrStr)
+			client = newSharedClient(s.logger, conf, serverAddrStr)
 			s.clients[key] = client
 			s.lock.Unlock()
 			// new client, we are done
@@ -145,6 +152,8 @@ type sharedClientResponse struct {
 
 // A SharedClient keeps state for concurrent transactions on the same upstream client/connection.
 type SharedClient struct {
+	logger *slog.Logger
+
 	serverAddr string
 
 	*dns.Client
@@ -155,14 +164,17 @@ type SharedClient struct {
 	wg sync.WaitGroup
 	// size of receive buffers to allocate, must only grow
 	udpSize atomic.Uint32
+	// reads counts the messages read from the upstream connection so far
+	reads atomic.Uint64
 
 	lock.Mutex // protects the fields below
 	refcount   int
 	conn       *dns.Conn
 }
 
-func newSharedClient(conf *dns.Client, serverAddr string) *SharedClient {
+func newSharedClient(logger *slog.Logger, conf *dns.Client, serverAddr string) *SharedClient {
 	return &SharedClient{
+		logger:     logger,
 		refcount:   1,
 		serverAddr: serverAddr,
 		Client:     conf,
@@ -178,7 +190,7 @@ func (c *SharedClient) ExchangeShared(m *dns.Msg) (r *dns.Msg, rtt time.Duration
 }
 
 // handler is started when the connection is dialed
-func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests chan request, size *atomic.Uint32) {
+func handler(logger *slog.Logger, wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests chan request, size *atomic.Uint32, reads *atomic.Uint64) {
 	defer wg.Done()
 
 	responses := make(chan sharedClientResponse)
@@ -216,6 +228,7 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 			// the timeouts before sending anything
 			r, err := syntheticConn.ReadMsg()
 			if err == nil {
+				reads.Add(1)
 				responses <- sharedClientResponse{r, 0, nil}
 				continue // receive immediately again
 			}
@@ -244,6 +257,13 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 	type waiter struct {
 		ch    chan sharedClientResponse
 		start time.Time
+		// reads is the value of 'reads' at the time the request was sent
+		reads uint64
+	}
+	// failed tells apart an upstream connection that yielded nothing at all from
+	// one that yielded messages this request did not match.
+	failed := func(w waiter, err error) sharedClientResponse {
+		return sharedClientResponse{nil, 0, fmt.Errorf("%w (upstream datagrams read since send: %d)", err, reads.Load()-w.reads)}
 	}
 	waitingResponses := make(map[uint16]waiter)
 	defer func() {
@@ -256,7 +276,7 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 		}
 
 		for _, waiter := range waitingResponses {
-			waiter.ch <- sharedClientResponse{nil, 0, net.ErrClosed}
+			waiter.ch <- failed(waiter, net.ErrClosed)
 			close(waiter.ch)
 		}
 	}()
@@ -297,7 +317,7 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 				req.ch <- sharedClientResponse{nil, 0, err}
 				close(req.ch)
 			} else {
-				waitingResponses[req.msg.Id] = waiter{req.ch, start}
+				waitingResponses[req.msg.Id] = waiter{req.ch, start, reads.Load()}
 
 				// If this message requires a larger receive buffer, ensure we allocate larger
 				// buffers for this conn. It's theoretically possible that we're already blocking on
@@ -326,7 +346,7 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 				// ReadMsg failed, but we cannot match it to a request,
 				// so complete all pending requests.
 				for _, waiter := range waitingResponses {
-					waiter.ch <- sharedClientResponse{nil, 0, resp.err}
+					waiter.ch <- failed(waiter, resp.err)
 					close(waiter.ch)
 				}
 				waitingResponses = make(map[uint16]waiter)
@@ -336,6 +356,20 @@ func handler(wg *sync.WaitGroup, client *dns.Client, conn *dns.Conn, requests ch
 					resp.rtt = time.Since(waiter.start)
 					waiter.ch <- resp
 					close(waiter.ch)
+				} else {
+					// Nothing is waiting for this id, so the response is dropped here
+					// rather than on the wire, and the requester times out instead.
+					var qname string
+					if len(resp.msg.Question) > 0 {
+						qname = resp.msg.Question[0].Name
+					}
+					logger.Warn(
+						"Discarding upstream DNS response that matches no pending request",
+						logfields.Server, conn.RemoteAddr(),
+						logfields.DNSRequestID, resp.msg.Id,
+						logfields.DNSName, qname,
+						logfields.PendingDNSRequestIDs, slices.Sorted(maps.Keys(waitingResponses)),
+					)
 				}
 			}
 		}
@@ -352,7 +386,7 @@ func (c *SharedClient) ExchangeSharedContext(ctx context.Context, m *dns.Msg) (r
 		}
 		// Start handler for sending and receiving.
 		c.wg.Add(1)
-		go handler(&c.wg, c.Client, c.conn, c.requests, &c.udpSize)
+		go handler(c.logger, &c.wg, c.Client, c.conn, c.requests, &c.udpSize, &c.reads)
 	}
 	c.Unlock()
 

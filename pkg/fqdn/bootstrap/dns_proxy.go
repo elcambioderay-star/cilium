@@ -14,6 +14,7 @@ import (
 	"github.com/cilium/cilium/pkg/fqdn/proxy"
 	"github.com/cilium/cilium/pkg/fqdn/re"
 	"github.com/cilium/cilium/pkg/fqdn/service"
+	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/option"
 )
 
@@ -34,6 +35,10 @@ type dnsProxyParams struct {
 	FQDNConfig         service.FQDNConfig
 	DNSRequestHandler  messagehandler.DNSMessageHandler
 	ProxyLookupHandler lookup.ProxyLookupHandler
+
+	// CTMaps is only provided by the agent, the standalone proxy runs without
+	// access to the datapath conntrack maps.
+	CTMaps ctmap.CTMaps `optional:"true"`
 }
 
 // newDNSProxy initializes the DNS l7 proxy.
@@ -62,7 +67,8 @@ func newDNSProxy(params dnsProxyParams) (proxy.DNSProxier, error) {
 	proxy := dnsproxy.NewDNSProxy(
 		dnsProxyConfig,
 		params.ProxyLookupHandler,
-		params.DNSRequestHandler.NotifyOnDNSMsg)
+		params.DNSRequestHandler.NotifyOnDNSMsg,
+		params.CTMaps)
 
 	return proxy, nil
 }

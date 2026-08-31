@@ -105,6 +105,7 @@ func setupDNSProxyTestSuite(tb testing.TB) *DNSProxyTestSuite {
 		func(lookupTime time.Time, ep *endpoint.Endpoint, epIPPort string, serverID identity.NumericIdentity, dstAddr netip.AddrPort, details *MsgDetails, protocol string, allowed bool, stat *ProxyRequestContext) error {
 			return nil
 		},
+		nil,
 	)
 	err := proxy.Listen(0)
 	require.NoError(tb, err, "error listening for DNS requests")
